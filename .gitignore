@@ -1,0 +1,30 @@
+# Build trees
+/build/
+/build-*/
+/out/
+/_build/
+CMakeUserPresets.json
+
+# IDE
+/.vs/
+/.vscode/
+/.idea/
+*.user
+*.suo
+
+# Artifacts and debris
+*.log
+*.tmp
+*.obj
+*.pdb
+*.ilk
+/Testing/
+*.crash
+# Core dumps land at the repository root; anchoring keeps the pattern from
+# swallowing source directories that happen to be named "core".
+/core
+/core.*
+
+# Local scratch
+/scratch/
+/.scratch/

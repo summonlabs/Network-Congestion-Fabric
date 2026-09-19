@@ -1,0 +1,3 @@
+# Normalise line endings so that a fresh clone builds and diffs identically on
+# every platform. No binary files are tracked in 1.0.0.
+* text=auto eol=lf
