@@ -9,6 +9,8 @@
 #include "support.hpp"
 
 #include <atomic>
+#include <chrono>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -21,6 +23,8 @@ namespace {
 
 #include "ncf/ipc/channel.hpp"
 #include "ncf/ipc/process.hpp"
+#include "ncf/runtime/publisher.hpp"
+#include "ncf/transport/frame.hpp"
 
 using namespace ncf;
 using namespace ncf::test;
@@ -264,4 +268,128 @@ NCF_TEST(ipc_child_process_can_be_terminated_while_running) {
   const Result<int> code = child.value().wait();
   NCF_REQUIRE(code.ok());
   NCF_CHECK(!child.value().running());
+}
+
+NCF_TEST(ipc_publisher_stamps_never_run_ahead_of_a_slow_coordinator) {
+  const std::string endpoint = make_endpoint_name("ncf-ipc-clock");
+  Result<PipeListener> listener = PipeListener::create(listener_options(endpoint));
+  NCF_REQUIRE(listener.ok());
+  std::atomic<bool> cancel{false};
+
+  PublisherClientOptions options;
+  options.endpoint = endpoint;
+  options.publisher = PublisherId::from_value(1);
+  options.boot = BootId::from_value(7);
+  PublisherScript script;
+  script.domain = DomainId::from_value(1);
+  script.resources = {ResourceId::from_value(1)};
+  script.samples = 1;
+  script.utilization_ppm = 500000;
+  script.send_goodbye = false;
+  Result<PublisherReport> published = Status(ErrCode::Internal, "not run");
+  std::thread publisher([&options, &script, &published]() { published = run_publisher(options, script); });
+
+  // This test plays the coordinator, on the same clock the publisher reads, so
+  // a correctly aligned stamp is never later than the moment it arrives.
+  const auto clock_now = []() {
+    return static_cast<Tick>(std::chrono::steady_clock::now().time_since_epoch().count() / 1000);
+  };
+  Result<ChannelPtr> server = listener.value().accept(cancel);
+  if (!server.ok()) {
+    publisher.join();
+    listener.value().close();
+    NCF_FAIL("accept failed: " + server.status().describe());
+    return;
+  }
+  FrameDecoder decoder;
+  std::vector<std::byte> buffer(8192);
+  const auto next_frame = [&server, &decoder, &buffer](FrameType wanted) -> std::optional<Frame> {
+    for (;;) {
+      Result<std::optional<Frame>> next = decoder.next();
+      if (!next.ok()) {
+        return std::nullopt;
+      }
+      if (next.value().has_value()) {
+        if (next.value()->type() == wanted) {
+          return std::move(next.value());
+        }
+        continue;
+      }
+      const Result<std::size_t> read = server.value()->read(buffer);
+      if (!read.ok() || read.value() == 0) {
+        return std::nullopt;
+      }
+      if (!decoder.push(std::span<const std::byte>(buffer.data(), read.value())).ok()) {
+        return std::nullopt;
+      }
+    }
+  };
+  const auto reply = [&server](const Frame& request, FrameType type,
+                               const Result<std::vector<std::byte>>& payload) -> bool {
+    if (!payload.ok()) {
+      return false;
+    }
+    Frame frame;
+    frame.header.type = static_cast<std::uint16_t>(type);
+    frame.header.flags =
+        static_cast<std::uint16_t>(kFrameFlagReply) | static_cast<std::uint16_t>(kFrameFlagFinal);
+    frame.header.epoch = request.header.epoch;
+    frame.header.boot = request.header.boot;
+    frame.header.publisher = request.header.publisher;
+    frame.header.connection = request.header.connection;
+    frame.header.sequence = request.header.sequence;
+    frame.header.nonce = request.header.nonce;
+    frame.payload = payload.value();
+    std::vector<std::byte> encoded;
+    return FrameCodec::encode(frame, encoded).ok() && server.value()->write(encoded).ok();
+  };
+
+  bool exchanged = false;
+  bool never_ahead = false;
+  bool completed = false;
+  const std::optional<Frame> hello = next_frame(FrameType::Hello);
+  if (hello.has_value()) {
+    // A slow coordinator reads its clock only after a delay, as when the hello
+    // waits for the fabric lock behind a durable write.
+    sleep_micros(100000);
+    HelloAckMessage ack;
+    ack.epoch = EpochId::from_value(1);
+    ack.accepted = true;
+    ack.coordinator_tick = clock_now();
+    if (reply(hello.value(), FrameType::HelloAck, encode_hello_ack(ack))) {
+      const std::optional<Frame> evidence = next_frame(FrameType::Evidence);
+      const Tick arrived = clock_now();
+      if (evidence.has_value()) {
+        const Result<EvidenceBatch> batch = decode_evidence(evidence.value().payload);
+        if (batch.ok() && !batch.value().samples.empty()) {
+          exchanged = true;
+          never_ahead = batch.value().submitted_tick <= arrived;
+          for (const EvidenceSample& sample : batch.value().samples) {
+            if (sample.observed_tick > arrived) {
+              never_ahead = false;
+            }
+          }
+        }
+        EvidenceAckMessage acknowledgement;
+        acknowledgement.epoch = EpochId::from_value(1);
+        acknowledgement.accepted = 1;
+        completed = reply(evidence.value(), FrameType::EvidenceAck, encode_evidence_ack(acknowledgement));
+      }
+    }
+  }
+  if (completed) {
+    publisher.join();
+    server.value()->close();
+  } else {
+    // End the publisher's pending read so a broken exchange cannot hang.
+    server.value()->close();
+    publisher.join();
+  }
+  listener.value().close();
+  NCF_CHECK(exchanged);
+  // The coordinator refuses an observation stamped more than its skew bound
+  // ahead of its clock, so a stamp must never run ahead of it, however long the
+  // coordinator took to answer the hello.
+  NCF_CHECK(never_ahead);
+  NCF_CHECK(published.ok());
 }

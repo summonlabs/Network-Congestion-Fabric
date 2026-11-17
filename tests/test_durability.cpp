@@ -5,9 +5,12 @@
 #include "framework.hpp"
 #include "support.hpp"
 
+#include <chrono>
 #include <cstdio>
+#include <fstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "ncf/core/crc32c.hpp"
@@ -641,4 +644,46 @@ NCF_TEST(store_format_version_is_enforced) {
   const Result<Store> damaged = Store::open(directory.path(), options, damaged_replay);
   NCF_CHECK(!damaged.ok());
   NCF_CHECK(damaged.status().code() == ErrCode::Corrupt);
+}
+
+NCF_TEST(snapshot_replacement_waits_for_a_reader_to_close) {
+  TempDir directory("snapshot-reader");
+  SnapshotOptions options;
+  SnapshotHeader header;
+  header.epoch = 4;
+  header.coordinator_boot = 5;
+  header.coordinator_boot_counter = 6;
+  header.last_sequence = 7;
+  std::vector<JournalRecord> records;
+  JournalRecord record;
+  record.header.type = static_cast<std::uint16_t>(RecordType::Payload);
+  record.header.sequence = 1;
+  const std::string body = "snapshot-body";
+  record.payload.assign(reinterpret_cast<const std::byte*>(body.data()),
+                        reinterpret_cast<const std::byte*>(body.data()) + body.size());
+  records.push_back(record);
+  const std::filesystem::path path = directory.file("ncf.snapshot");
+  NCF_REQUIRE(write_snapshot(path, header, records, options).ok());
+
+  header.last_sequence = 8;
+  bool reader_opened = false;
+  bool written = false;
+  {
+    // Another tool reading the store (an inspection, a scan) holds the snapshot
+    // open while it is replaced, and closes it shortly after.
+    std::ifstream reader(path, std::ios::binary);
+    reader_opened = reader.is_open();
+    std::thread writer([&path, &header, &records, &options, &written] {
+      written = write_snapshot(path, header, records, options).ok();
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    reader.close();
+    writer.join();
+  }
+  NCF_CHECK(reader_opened);
+  // The snapshot is not lost because a reader had the file open for a moment.
+  NCF_CHECK(written);
+  Result<SnapshotContents> read = read_snapshot(path, options);
+  NCF_REQUIRE(read.ok());
+  NCF_CHECK_EQ(read.value().header.last_sequence, 8ull);
 }

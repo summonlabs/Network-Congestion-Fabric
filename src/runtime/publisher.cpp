@@ -130,7 +130,6 @@ Result<PublisherReport> run_publisher(const PublisherClientOptions& options, con
     }
     ++report.frames_sent;
 
-    const Tick before = static_cast<Tick>(std::chrono::steady_clock::now().time_since_epoch().count() / 1000);
     std::vector<std::byte> buffer(kReadBufferBytes);
     bool got_ack = false;
     while (!got_ack) {
@@ -170,12 +169,17 @@ Result<PublisherReport> run_publisher(const PublisherClientOptions& options, con
         report.authority_generation = ack.value().authority_generation;
         report.granted = ack.value().granted;
         if (ack.value().coordinator_tick != kNoTick) {
-          // Align to the midpoint of the round trip so that the offset carries
-          // roughly half the one-way latency as its error, and never becomes a
-          // future stamp that the coordinator would refuse.
-          const Tick midpoint = before + (after - before) / 2;
+          // Align to the arrival of the acknowledgement. The coordinator read
+          // its clock before it sent the acknowledgement, so this alignment can
+          // only place a stamp behind the coordinator clock (by at most the
+          // acknowledgement's one-way latency), never ahead of it. A midpoint
+          // alignment put every stamp ahead by half of any delay the
+          // coordinator spent before reading its clock (a hello waiting for the
+          // fabric lock behind a durable write), and the coordinator refuses a
+          // stamp more than its skew bound ahead, so all of the publisher's
+          // evidence was discarded.
           bridge.offset = static_cast<std::int64_t>(ack.value().coordinator_tick) -
-                          static_cast<std::int64_t>(midpoint);
+                          static_cast<std::int64_t>(after);
           bridge.aligned = true;
         }
         got_ack = true;
